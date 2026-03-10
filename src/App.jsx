@@ -1,359 +1,473 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
-  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
-  LineChart, Line, CartesianGrid, PieChart, Pie, Cell,
-  ScatterChart, Scatter, ZAxis, Legend,
+  LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip,
+  ResponsiveContainer, CartesianGrid, Legend, Cell,
+  AreaChart, Area, RadarChart, Radar, PolarGrid,
+  PolarAngleAxis, PolarRadiusAxis,
 } from "recharts";
 
-const API = "/api";
-const COLORS = ["#FFD700","#00D4FF","#FF6B35","#A855F7","#10B981","#F43F5E","#3B82F6","#F59E0B","#06B6D4","#8B5CF6"];
-const fmt = (n) => n == null ? "—" : n >= 1e6 ? `${(n/1e6).toFixed(1)}M` : n >= 1e3 ? `${(n/1e3).toFixed(1)}K` : String(n);
+// ── Config ────────────────────────────────────────────────────────────
+const MY_ISLANDS = [
+  { code: "3808-8348-4233", color: "#FFD700", short: "MAP1" },
+  { code: "5240-9604-1946", color: "#00D4FF", short: "MAP2" },
+  { code: "0126-6244-2163", color: "#FF6B35", short: "MAP3" },
+  { code: "3890-4970-8669", color: "#A855F7", short: "MAP4" },
+];
+const POLL_INTERVAL = 60000; // 60秒ごとに更新
+const MAX_RT_POINTS = 30;    // リアルタイムグラフに保持するデータ点数
 
-// ─── API helper ───────────────────────────────────────────────────────
+const fmt   = (n) => n == null ? "—" : n >= 1e6 ? `${(n/1e6).toFixed(1)}M` : n >= 1e3 ? `${(n/1e3).toFixed(1)}K` : String(Math.round(n));
+const fmtMin= (s) => s == null ? "—" : `${Math.floor(s/60)}分${s%60}秒`;
+const now   = () => new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+// ── API fetch ─────────────────────────────────────────────────────────
 async function apiFetch(path, params = {}) {
   const qs = new URLSearchParams(params).toString();
-  const url = `${API}/${path}${qs ? "?" + qs : ""}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  const url = `/api/${path}${qs ? "?" + qs : ""}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status}: ${url}`);
+  return r.json();
 }
 
-// ─── Skeleton ─────────────────────────────────────────────────────────
-const Sk = ({ h = 18, w = "100%" }) => (
-  <div style={{ height: h, width: w, background: "#ffffff0f", borderRadius: 5, animation: "pulse 1.4s ease-in-out infinite" }} />
+// ── Sub-components ────────────────────────────────────────────────────
+const Sk = ({ h = 20, w = "100%" }) => (
+  <div style={{ height: h, width: w, background: "#ffffff08", borderRadius: 5, animation: "pulse 1.4s ease-in-out infinite" }} />
 );
 
-// ─── Tooltip ──────────────────────────────────────────────────────────
 const CTip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
   return (
-    <div style={{ background: "#0a0b18", border: "1px solid #FFD700", borderRadius: 8, padding: "10px 14px", fontSize: 13, fontFamily: "inherit" }}>
-      {label && <div style={{ color: "#FFD700", fontWeight: 700, marginBottom: 4 }}>{label}</div>}
+    <div style={{ background: "#080910", border: "1px solid #2a2d50", borderRadius: 8, padding: "10px 14px", fontSize: 12, fontFamily: "inherit" }}>
+      {label && <div style={{ color: "#888", marginBottom: 4 }}>{label}</div>}
       {payload.map((p, i) => (
-        <div key={i} style={{ color: p.color || "#ccc" }}>{p.name}: <b>{fmt(p.value)}</b></div>
+        <div key={i} style={{ color: p.color, fontWeight: 600 }}>{p.name}: {fmt(p.value)}</div>
       ))}
     </div>
   );
 };
 
-// ─── StatCard ─────────────────────────────────────────────────────────
-const StatCard = ({ icon, label, value, color, loading }) => (
-  <div style={{ background: "linear-gradient(135deg,#0e0f22,#121328)", border: "1px solid #1e2040", borderRadius: 12, padding: "16px 12px", textAlign: "center", flex: "1 1 140px" }}>
-    <div style={{ fontSize: 26, marginBottom: 6 }}>{icon}</div>
-    {loading ? <Sk h={24} w="60%" /> : (
-      <div style={{ fontSize: 22, fontWeight: 700, color, letterSpacing: 1 }}>{value ?? "—"}</div>
-    )}
-    <div style={{ fontSize: 11, color: "#555", marginTop: 4, letterSpacing: .5 }}>{label}</div>
-  </div>
+const Pulse = ({ active }) => (
+  <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: active ? "#10B981" : "#444", boxShadow: active ? "0 0 6px #10B981" : "none", animation: active ? "blink 1s ease-in-out infinite" : "none" }} />
 );
 
-// ─── Main App ─────────────────────────────────────────────────────────
+// ── Main ──────────────────────────────────────────────────────────────
 export default function App() {
-  const [islands, setIslands]     = useState([]);
-  const [metrics, setMetrics]     = useState({});
-  const [selected, setSelected]   = useState(null);
-  const [trend, setTrend]         = useState([]);
-  const [loading, setLoading]     = useState(true);
-  const [trendLoad, setTrendLoad] = useState(false);
-  const [error, setError]         = useState(null);
-  const [search, setSearch]       = useState("");
-  const [tab, setTab]             = useState("ranking");
-  const [updated, setUpdated]     = useState(null);
+  const [meta,    setMeta]    = useState({});   // { code: { title, description } }
+  const [latest,  setLatest]  = useState({});   // { code: { dau, sessions, playDuration, favorites } }
+  const [history, setHistory] = useState([]);   // 7-day daily history for all islands
+  const [rtData,  setRtData]  = useState([]);   // rolling realtime points [{ time, MAP1, MAP2, ... }]
+  const [loading, setLoading] = useState(true);
+  const [polling, setPolling] = useState(false);
+  const [error,   setError]   = useState(null);
+  const [tab,     setTab]     = useState("realtime");
+  const [countdown, setCd]    = useState(60);
+  const timerRef = useRef(null);
+  const cdRef    = useRef(null);
 
-  // Fetch island list + top-10 metrics
-  const fetchAll = useCallback(async () => {
-    setLoading(true); setError(null);
+  // ── Fetch metadata once ──────────────────────────────────────────
+  const fetchMeta = useCallback(async () => {
+    const results = await Promise.allSettled(
+      MY_ISLANDS.map(i => apiFetch(`islands/${i.code}`))
+    );
+    const m = {};
+    results.forEach((r, i) => {
+      if (r.status === "fulfilled") {
+        const d = r.value;
+        m[MY_ISLANDS[i].code] = {
+          title: d.title || d.name || MY_ISLANDS[i].short,
+          description: d.description || "",
+          tags: d.tags || [],
+        };
+      } else {
+        m[MY_ISLANDS[i].code] = { title: MY_ISLANDS[i].short, description: "", tags: [] };
+      }
+    });
+    setMeta(m);
+  }, []);
+
+  // ── Fetch latest metrics (1-hour interval = most recent snapshot) ─
+  const fetchLatest = useCallback(async () => {
+    setPolling(true);
     try {
-      const data = await apiFetch("islands", { limit: 20 });
-      const list = data.islands || data.data || data || [];
-      setIslands(list);
-      setUpdated(new Date());
-
-      const codes = list.slice(0, 10).map(i => i.code).filter(Boolean);
       const results = await Promise.allSettled(
-        codes.map(code => apiFetch(`islands/${code}/metrics`, { interval: "day", limit: 1 }))
+        MY_ISLANDS.map(i =>
+          apiFetch(`islands/${i.code}/metrics`, { interval: "hour", limit: 1 })
+        )
       );
-      const m = {};
-      results.forEach((r, i) => { if (r.status === "fulfilled") m[codes[i]] = r.value; });
-      setMetrics(m);
+      const l = {};
+      results.forEach((r, i) => {
+        const code = MY_ISLANDS[i].code;
+        if (r.status === "fulfilled") {
+          const rows = r.value.metrics || r.value.data || [];
+          const d = rows[0] || {};
+          l[code] = {
+            dau:          d.dau          ?? d.dailyActiveUsers     ?? null,
+            sessions:     d.sessions     ?? d.totalSessions        ?? null,
+            playDuration: d.averagePlayDuration ?? d.play_duration ?? null,
+            totalMinutes: d.totalMinutesPlayed  ?? d.total_minutes ?? null,
+            favorites:    d.favorites    ?? d.playerFavorites      ?? null,
+          };
+        } else {
+          l[code] = {};
+        }
+      });
+      setLatest(l);
+
+      // Append a realtime point
+      const point = { time: now() };
+      MY_ISLANDS.forEach(isl => {
+        point[isl.short] = l[isl.code]?.sessions ?? 0;
+        point[`${isl.short}_dau`] = l[isl.code]?.dau ?? 0;
+      });
+      setRtData(prev => [...prev.slice(-MAX_RT_POINTS + 1), point]);
+      setError(null);
     } catch (e) {
       setError(e.message);
     } finally {
-      setLoading(false);
+      setPolling(false);
     }
   }, []);
 
-  // Fetch 7-day trend for selected island
-  const fetchTrend = useCallback(async (code) => {
-    setTrendLoad(true);
-    try {
-      const end   = new Date().toISOString().slice(0, 10);
-      const start = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
-      const data  = await apiFetch(`islands/${code}/metrics`, { interval: "day", startDate: start, endDate: end });
-      const rows  = data.metrics || data.data || [];
-      setTrend(rows.map(r => ({
-        date:     (r.date || r.timestamp || "").slice(5, 10),
-        dau:      r.dau ?? r.dailyActiveUsers ?? 0,
-        duration: Math.round((r.averagePlayDuration ?? 0) / 60),
-        sessions: r.sessions ?? 0,
-      })));
-    } catch { setTrend([]); }
-    finally   { setTrendLoad(false); }
+  // ── Fetch 7-day daily history ──────────────────────────────────────
+  const fetchHistory = useCallback(async () => {
+    const end   = new Date().toISOString().slice(0, 10);
+    const start = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+    const results = await Promise.allSettled(
+      MY_ISLANDS.map(i =>
+        apiFetch(`islands/${i.code}/metrics`, { interval: "day", startDate: start, endDate: end })
+      )
+    );
+    // Build unified [ { date, MAP1, MAP2, MAP3, MAP4 } ]
+    const byDate = {};
+    results.forEach((r, idx) => {
+      if (r.status !== "fulfilled") return;
+      const rows = r.value.metrics || r.value.data || [];
+      rows.forEach(row => {
+        const date = (row.date || row.timestamp || "").slice(5, 10);
+        if (!byDate[date]) byDate[date] = { date };
+        byDate[date][MY_ISLANDS[idx].short]              = row.dau ?? row.dailyActiveUsers ?? 0;
+        byDate[date][`${MY_ISLANDS[idx].short}_sessions`] = row.sessions ?? 0;
+        byDate[date][`${MY_ISLANDS[idx].short}_dur`]      = Math.round((row.averagePlayDuration ?? 0) / 60);
+      });
+    });
+    setHistory(Object.values(byDate).sort((a, b) => a.date.localeCompare(b.date)));
   }, []);
 
-  useEffect(() => { fetchAll(); }, [fetchAll]);
-  useEffect(() => { if (selected?.code) fetchTrend(selected.code); }, [selected, fetchTrend]);
+  // ── Initial load ───────────────────────────────────────────────────
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      await Promise.all([fetchMeta(), fetchLatest(), fetchHistory()]);
+      setLoading(false);
+    })();
+  }, [fetchMeta, fetchLatest, fetchHistory]);
 
-  // Derived chart data
-  const rankData = islands.slice(0, 10).map(isl => {
-    const m = metrics[isl.code];
-    const r = m?.metrics?.[0] || m?.data?.[0] || {};
-    return {
-      name:     (isl.title || isl.code || "").slice(0, 16),
-      code:     isl.code,
-      dau:      r.dau ?? r.dailyActiveUsers ?? 0,
-      duration: Math.round((r.averagePlayDuration ?? 0) / 60),
+  // ── Auto-poll every 60s ────────────────────────────────────────────
+  useEffect(() => {
+    timerRef.current = setInterval(() => {
+      fetchLatest();
+      setCd(60);
+    }, POLL_INTERVAL);
+
+    cdRef.current = setInterval(() => {
+      setCd(prev => Math.max(0, prev - 1));
+    }, 1000);
+
+    return () => {
+      clearInterval(timerRef.current);
+      clearInterval(cdRef.current);
     };
-  });
-  const valid      = rankData.filter(d => d.dau > 0);
-  const totalDAU   = valid.reduce((s, d) => s + d.dau, 0);
-  const avgDur     = valid.length ? Math.round(valid.reduce((s, d) => s + d.duration, 0) / valid.length) : 0;
-  const pieData    = valid.slice(0, 6).map((d, i) => ({ name: d.name, value: d.dau, fill: COLORS[i] }));
-  const filtered   = islands.filter(i => (i.title || i.code || "").toLowerCase().includes(search.toLowerCase()));
+  }, [fetchLatest]);
 
-  // ── Responsive helper (mobile < 600px) ──
-  const isMobile = typeof window !== "undefined" && window.innerWidth < 600;
+  // ── Derived totals ─────────────────────────────────────────────────
+  const totalDAU      = MY_ISLANDS.reduce((s, i) => s + (latest[i.code]?.dau      ?? 0), 0);
+  const totalSessions = MY_ISLANDS.reduce((s, i) => s + (latest[i.code]?.sessions ?? 0), 0);
+  const avgDuration   = (() => {
+    const vals = MY_ISLANDS.map(i => latest[i.code]?.playDuration).filter(v => v != null);
+    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  })();
+
+  // Radar data: normalize each metric per island
+  const radarData = ["dau","sessions","totalMinutes"].map(key => {
+    const row = { metric: { dau:"DAU", sessions:"セッション", totalMinutes:"総プレイ時間" }[key] };
+    const vals = MY_ISLANDS.map(i => latest[i.code]?.[key] ?? 0);
+    const max  = Math.max(...vals, 1);
+    MY_ISLANDS.forEach((isl, idx) => { row[isl.short] = Math.round((vals[idx] / max) * 100); });
+    return row;
+  });
+
+  const isMobile = typeof window !== "undefined" && window.innerWidth < 640;
 
   return (
-    <div style={{ minHeight: "100vh", background: "#06070f", color: "#e8e8f0", fontFamily: "'Rajdhani','Barlow Condensed',sans-serif" }}>
+    <div style={{ minHeight: "100vh", background: "#05060e", color: "#e0e0f0", fontFamily: "'Rajdhani','Barlow Condensed',sans-serif" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;600;700&display=swap');
-        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-        body { background: #06070f; -webkit-text-size-adjust: 100%; }
-        @keyframes pulse   { 0%,100%{opacity:.35} 50%{opacity:.9} }
-        @keyframes slideIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
-        @keyframes glow    { 0%,100%{box-shadow:0 0 8px #FFD70033} 50%{box-shadow:0 0 22px #FFD70077} }
-        ::-webkit-scrollbar{width:4px} ::-webkit-scrollbar-track{background:#0d0d1a} ::-webkit-scrollbar-thumb{background:#FFD70055;border-radius:3px}
-        .card    { background:linear-gradient(135deg,#0e0f22,#121328); border:1px solid #1e2040; border-radius:12px; padding:16px; }
-        .tag     { display:inline-block; background:#FFD70022; color:#FFD700; border-radius:4px; padding:2px 8px; font-size:11px; font-weight:700; letter-spacing:1px; text-transform:uppercase; }
-        .tab     { padding:8px 16px; border-radius:6px; border:none; cursor:pointer; font-family:inherit; font-weight:700; font-size:13px; letter-spacing:.4px; transition:all .2s; white-space:nowrap; }
-        .tab-on  { background:#FFD700; color:#06070f; }
-        .tab-off { background:transparent; color:#777; border:1px solid #222; }
-        .tab-off:hover { border-color:#FFD70066; color:#FFD700; }
-        .irow    { padding:10px 12px; border-radius:8px; cursor:pointer; transition:background .15s; display:flex; align-items:center; gap:10px; border:1px solid transparent; }
-        .irow:hover { background:#FFD70010; border-color:#FFD70033; }
-        .irow-sel{ background:#FFD70015; border-color:#FFD70066 !important; animation:glow 2s ease-in-out infinite; }
-        input:focus { border-color:#FFD70066 !important; outline:none; }
-        @media(max-width:600px){
-          .main-grid   { grid-template-columns:1fr !important; }
-          .stats-grid  { flex-wrap:wrap; }
-          .tab-scroll  { overflow-x:auto; padding-bottom:4px; }
-        }
+        *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+        body{background:#05060e}
+        @keyframes pulse{0%,100%{opacity:.3}50%{opacity:.85}}
+        @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
+        @keyframes slideIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+        ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:#0a0b18}::-webkit-scrollbar-thumb{background:#FFD70044;border-radius:3px}
+        .card{background:linear-gradient(135deg,#0c0d1e,#10112a);border:1px solid #1a1c38;border-radius:12px;padding:16px}
+        .tab{padding:7px 15px;border-radius:6px;border:none;cursor:pointer;font-family:inherit;font-weight:700;font-size:12px;letter-spacing:.4px;transition:all .2s;white-space:nowrap}
+        .ton{background:#FFD700;color:#05060e}
+        .toff{background:transparent;color:#666;border:1px solid #1a1c38}
+        .toff:hover{border-color:#FFD70055;color:#FFD700}
+        .badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase}
+        @media(max-width:640px){.grid2{grid-template-columns:1fr!important}.tabs{overflow-x:auto;padding-bottom:3px}}
       `}</style>
 
       {/* ── Header ── */}
-      <header style={{ background: "linear-gradient(90deg,#06070f,#0c0d25 50%,#06070f)", borderBottom: "1px solid #1e2040", padding: "14px 16px", display: "flex", alignItems: "center", gap: 12, position: "sticky", top: 0, zIndex: 100, backdropFilter: "blur(12px)" }}>
-        <div style={{ fontSize: 22, fontWeight: 700, letterSpacing: 2, color: "#FFD700", textShadow: "0 0 18px #FFD70066" }}>⚡ FORTNITE</div>
-        <div style={{ fontSize: 11, color: "#444", letterSpacing: 2, textTransform: "uppercase", display: isMobile ? "none" : "block" }}>Island Analytics</div>
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
-          {updated && <span style={{ fontSize: 10, color: "#333" }}>{updated.toLocaleTimeString("ja-JP")}</span>}
-          <span className="tag">Live</span>
-          <button onClick={fetchAll} disabled={loading} style={{ background: "#1e2040", color: "#aaa", border: "1px solid #2a2d50", borderRadius: 6, padding: "6px 12px", cursor: "pointer", fontFamily: "inherit", fontSize: 12, opacity: loading ? .5 : 1 }}>
-            {loading ? "⟳" : "↻"}
+      <header style={{ background:"linear-gradient(90deg,#05060e,#0b0d22 50%,#05060e)", borderBottom:"1px solid #1a1c38", padding:"12px 16px", display:"flex", alignItems:"center", gap:12, position:"sticky", top:0, zIndex:100, backdropFilter:"blur(12px)" }}>
+        <div style={{ fontSize:20, fontWeight:700, letterSpacing:2, color:"#FFD700", textShadow:"0 0 16px #FFD70055" }}>⚡ MY ISLANDS</div>
+        <div style={{ fontSize:10, color:"#333", letterSpacing:3, textTransform:"uppercase" }}>Realtime Analytics</div>
+        <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:10 }}>
+          <Pulse active={!loading && !polling} />
+          <span style={{ fontSize:11, color:"#555" }}>次回更新 {countdown}s</span>
+          <button onClick={()=>{fetchLatest();fetchHistory();setCd(60);}} style={{ background:"#1a1c38", color:"#888", border:"1px solid #252745", borderRadius:6, padding:"5px 12px", cursor:"pointer", fontFamily:"inherit", fontSize:12, opacity: polling?0.5:1 }}>
+            {polling ? "⟳ 取得中" : "↻ 今すぐ更新"}
           </button>
         </div>
       </header>
 
-      <main style={{ padding: "16px" }}>
+      <main style={{ padding:"14px 14px 40px" }}>
 
         {/* ── Error ── */}
         {error && (
-          <div style={{ background: "#2a0a0a", border: "1px solid #F43F5E66", borderRadius: 12, padding: 20, textAlign: "center", marginBottom: 16, animation: "slideIn .3s ease" }}>
-            <div style={{ fontSize: 28, marginBottom: 6 }}>⚠️</div>
-            <div style={{ color: "#F43F5E", fontWeight: 700 }}>{error}</div>
-            <button onClick={fetchAll} style={{ background: "#FFD700", color: "#06070f", border: "none", borderRadius: 6, padding: "9px 22px", fontFamily: "inherit", fontWeight: 700, fontSize: 14, cursor: "pointer", marginTop: 12 }}>再試行</button>
+          <div style={{ background:"#1e0808", border:"1px solid #F43F5E55", borderRadius:10, padding:"14px 18px", marginBottom:14, fontSize:13, color:"#F43F5E" }}>
+            ⚠️ {error} — <span style={{ color:"#888" }}>APIサーバー経由で再試行してください</span>
           </div>
         )}
 
-        {/* ── Stats ── */}
-        <div className="stats-grid" style={{ display: "flex", gap: 12, marginBottom: 16, animation: "slideIn .4s ease" }}>
-          <StatCard icon="🏝️" label="島の数"         value={islands.length}    color="#00D4FF" loading={loading} />
-          <StatCard icon="👥" label="総DAU"          value={fmt(totalDAU)}     color="#FFD700" loading={loading} />
-          <StatCard icon="⏱️" label="平均プレイ時間"  value={`${avgDur}分`}     color="#A855F7" loading={loading} />
-          <StatCard icon="🏆" label="1位"            value={valid[0]?.name?.slice(0,12) || "—"} color="#10B981" loading={loading} />
+        {/* ── Island name cards ── */}
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10, marginBottom:14 }}>
+          {MY_ISLANDS.map(isl => {
+            const m  = meta[isl.code];
+            const lv = latest[isl.code];
+            return (
+              <div key={isl.code} className="card" style={{ borderColor: isl.color + "44", animation:"slideIn .4s ease" }}>
+                <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:8 }}>
+                  <div style={{ width:10, height:10, borderRadius:"50%", background:isl.color, flexShrink:0, boxShadow:`0 0 6px ${isl.color}` }} />
+                  <div style={{ fontSize:10, color:isl.color, fontWeight:700, letterSpacing:1 }}>{isl.short}</div>
+                </div>
+                {loading ? <Sk h={16} w="80%" /> : (
+                  <div style={{ fontSize:13, fontWeight:700, lineHeight:1.3, marginBottom:6, color:"#ddd" }}>
+                    {m?.title || isl.code}
+                  </div>
+                )}
+                <div style={{ fontSize:10, color:"#333", fontFamily:"monospace" }}>{isl.code}</div>
+                {!loading && lv && (
+                  <div style={{ display:"flex", gap:8, marginTop:8, flexWrap:"wrap" }}>
+                    <span style={{ fontSize:12, color:isl.color, fontWeight:700 }}>DAU {fmt(lv.dau)}</span>
+                    <span style={{ fontSize:12, color:"#555" }}>／</span>
+                    <span style={{ fontSize:12, color:"#aaa" }}>{fmt(lv.sessions)} sessions</span>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
 
-        {/* ── Tabs ── */}
-        <div className="tab-scroll" style={{ display: "flex", gap: 6, marginBottom: 14 }}>
-          {[["ranking","🏆 ランキング"],["duration","⏱️ 時間分布"],["pie","🥧 シェア"],["explore","🔍 島を探す"]].map(([t, l]) => (
-            <button key={t} className={`tab ${tab === t ? "tab-on" : "tab-off"}`} onClick={() => setTab(t)}>{l}</button>
+        {/* ── Summary stats ── */}
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10, marginBottom:14 }}>
+          {[
+            { label:"合計 DAU",        value: fmt(totalDAU),             icon:"👥", color:"#FFD700" },
+            { label:"合計セッション数", value: fmt(totalSessions),        icon:"🎮", color:"#00D4FF" },
+            { label:"平均プレイ時間",   value: fmtMin(Math.round(avgDuration)), icon:"⏱️", color:"#A855F7" },
+            { label:"監視中の島",       value: `${MY_ISLANDS.length} 島`, icon:"🏝️", color:"#10B981" },
+          ].map((s, i) => (
+            <div key={i} className="card" style={{ textAlign:"center", padding:"14px 10px" }}>
+              <div style={{ fontSize:22, marginBottom:6 }}>{s.icon}</div>
+              {loading ? <Sk h={22} w="60%" /> : (
+                <div style={{ fontSize:20, fontWeight:700, color:s.color }}>{s.value}</div>
+              )}
+              <div style={{ fontSize:11, color:"#444", marginTop:4 }}>{s.label}</div>
+            </div>
           ))}
         </div>
 
-        {/* ── Grid ── */}
-        <div className="main-grid" style={{ display: "grid", gridTemplateColumns: "1fr 320px", gap: 14, alignItems: "start" }}>
+        {/* ── Tabs ── */}
+        <div className="tabs" style={{ display:"flex", gap:6, marginBottom:12 }}>
+          {[
+            ["realtime","⚡ リアルタイム"],
+            ["daily",   "📅 7日間DAU"],
+            ["sessions","🎮 セッション推移"],
+            ["duration","⏱️ プレイ時間"],
+            ["radar",   "🕸️ 総合比較"],
+          ].map(([t, l]) => (
+            <button key={t} className={`tab ${tab===t?"ton":"toff"}`} onClick={()=>setTab(t)}>{l}</button>
+          ))}
+        </div>
 
-          {/* Left chart */}
-          <div className="card" style={{ minHeight: 360, animation: "slideIn .3s ease" }}>
-            {loading ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {[...Array(7)].map((_, i) => <Sk key={i} h={36} />)}
+        {/* ── Chart Area ── */}
+        <div className="card" style={{ minHeight:360, animation:"slideIn .3s ease", marginBottom:14 }}>
+          {loading ? (
+            <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+              {[...Array(8)].map((_,i)=><Sk key={i} h={32} />)}
+            </div>
+          ) : tab === "realtime" ? (
+            <>
+              <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:14 }}>
+                <Pulse active={!polling} />
+                <span style={{ fontSize:13, color:"#666" }}>セッション数 — 60秒ごとに自動更新 ({rtData.length} ポイント取得済み)</span>
               </div>
-            ) : tab === "ranking" ? (
-              <>
-                <p style={{ fontSize: 12, color: "#555", marginBottom: 14 }}>日間アクティブユーザー（上位10島）</p>
-                {valid.length === 0
-                  ? <div style={{ textAlign: "center", color: "#444", padding: "50px 0" }}>DAUデータがありません</div>
-                  : <ResponsiveContainer width="100%" height={320}>
-                      <BarChart data={valid} layout="vertical" margin={{ left: 0, right: 36 }}>
-                        <XAxis type="number" tickFormatter={fmt} stroke="#222" tick={{ fill: "#555", fontSize: 11 }} />
-                        <YAxis type="category" dataKey="name" width={130} tick={{ fill: "#999", fontSize: 11 }} />
-                        <Tooltip content={<CTip />} />
-                        <Bar dataKey="dau" name="DAU" radius={[0, 4, 4, 0]}>
-                          {valid.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-                        </Bar>
-                      </BarChart>
-                    </ResponsiveContainer>
-                }
-              </>
-            ) : tab === "duration" ? (
-              <>
-                <p style={{ fontSize: 12, color: "#555", marginBottom: 14 }}>プレイ時間(分) vs DAU — 右上が人気で長時間</p>
+              {rtData.length === 0 ? (
+                <div style={{ textAlign:"center", color:"#333", padding:"60px 0", fontSize:14 }}>データ取得中...</div>
+              ) : (
                 <ResponsiveContainer width="100%" height={320}>
-                  <ScatterChart margin={{ top: 10, right: 30, bottom: 20, left: 0 }}>
-                    <CartesianGrid stroke="#1a1a2e" />
-                    <XAxis dataKey="dau" name="DAU" tickFormatter={fmt} stroke="#222" tick={{ fill: "#555", fontSize: 11 }} label={{ value: "DAU", position: "insideBottom", offset: -6, fill: "#444", fontSize: 11 }} />
-                    <YAxis dataKey="duration" name="分" stroke="#222" tick={{ fill: "#555", fontSize: 11 }} label={{ value: "分", angle: -90, position: "insideLeft", fill: "#444", fontSize: 11 }} />
-                    <ZAxis range={[60, 260]} />
-                    <Tooltip content={<CTip />} cursor={{ strokeDasharray: "3 3" }} />
-                    <Scatter data={valid} fillOpacity={0.85}>
-                      {valid.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-                    </Scatter>
-                  </ScatterChart>
-                </ResponsiveContainer>
-              </>
-            ) : tab === "pie" ? (
-              <>
-                <p style={{ fontSize: 12, color: "#555", marginBottom: 14 }}>DAUシェア（上位6島）</p>
-                <ResponsiveContainer width="100%" height={320}>
-                  <PieChart>
-                    <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="45%" outerRadius="60%"
-                      label={({ name, percent }) => `${name.slice(0, 10)} ${(percent * 100).toFixed(0)}%`}
-                      labelLine={{ stroke: "#333" }}>
-                      {pieData.map((d, i) => <Cell key={i} fill={d.fill} />)}
-                    </Pie>
-                    <Tooltip formatter={v => fmt(v)} />
-                    <Legend />
-                  </PieChart>
-                </ResponsiveContainer>
-              </>
-            ) : (
-              <>
-                <input
-                  placeholder="🔍 島名 / コードで検索..."
-                  value={search}
-                  onChange={e => setSearch(e.target.value)}
-                  style={{ width: "100%", background: "#0d0e1f", border: "1px solid #1e2040", borderRadius: 8, padding: "10px 13px", color: "#e8e8f0", fontSize: 14, fontFamily: "inherit", marginBottom: 10 }}
-                />
-                <div style={{ maxHeight: 320, overflowY: "auto", display: "flex", flexDirection: "column", gap: 3 }}>
-                  {filtered.slice(0, 40).map((isl, i) => (
-                    <div key={isl.code} className={`irow ${selected?.code === isl.code ? "irow-sel" : ""}`} onClick={() => setSelected(isl)}>
-                      <div style={{ width: 22, height: 22, borderRadius: 5, background: COLORS[i % COLORS.length] + "22", border: `1px solid ${COLORS[i % COLORS.length]}55`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: COLORS[i % COLORS.length], flexShrink: 0 }}>{i + 1}</div>
-                      <div style={{ flex: 1, overflow: "hidden" }}>
-                        <div style={{ fontWeight: 600, fontSize: 14, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{isl.title || isl.code}</div>
-                        <div style={{ fontSize: 10, color: "#3a3a5c", letterSpacing: .5, fontFamily: "monospace" }}>{isl.code}</div>
-                      </div>
-                      {selected?.code === isl.code && <span style={{ color: "#FFD700", flexShrink: 0 }}>▶</span>}
-                    </div>
-                  ))}
-                </div>
-              </>
-            )}
-          </div>
-
-          {/* Right panel */}
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-
-            {/* Island detail */}
-            {selected ? (
-              <>
-                <div className="card" style={{ animation: "slideIn .3s ease" }}>
-                  <span className="tag">Selected</span>
-                  <div style={{ fontSize: 18, fontWeight: 700, color: "#FFD700", margin: "10px 0 4px", lineHeight: 1.3 }}>{selected.title || selected.code}</div>
-                  <div style={{ fontSize: 10, color: "#333", letterSpacing: 1, marginBottom: 10, fontFamily: "monospace" }}>{selected.code}</div>
-                  {selected.description && (
-                    <div style={{ fontSize: 12, color: "#777", lineHeight: 1.7, marginBottom: 10 }}>{selected.description.slice(0, 140)}...</div>
-                  )}
-                  {selected.tags?.length > 0 && (
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                      {selected.tags.slice(0, 6).map(t => (
-                        <span key={t} style={{ background: "#1a1a2e", color: "#888", border: "1px solid #252540", borderRadius: 4, padding: "2px 7px", fontSize: 10 }}>{t}</span>
+                  <AreaChart data={rtData} margin={{ top:5, right:20, bottom:5, left:0 }}>
+                    <defs>
+                      {MY_ISLANDS.map(isl => (
+                        <linearGradient key={isl.code} id={`grad_${isl.short}`} x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%"  stopColor={isl.color} stopOpacity={0.3} />
+                          <stop offset="95%" stopColor={isl.color} stopOpacity={0} />
+                        </linearGradient>
                       ))}
-                    </div>
-                  )}
-                </div>
-
-                {/* 7-day DAU trend */}
-                <div className="card">
-                  <p style={{ fontSize: 12, color: "#555", marginBottom: 10 }}>📈 7日間 DAUトレンド</p>
-                  {trendLoad ? (
-                    <div style={{ display: "flex", flexDirection: "column", gap: 7 }}><Sk h={14} /><Sk h={120} /></div>
-                  ) : trend.length === 0 ? (
-                    <div style={{ color: "#333", fontSize: 12, textAlign: "center", padding: "16px 0" }}>データなし</div>
-                  ) : (
-                    <ResponsiveContainer width="100%" height={130}>
-                      <LineChart data={trend}>
-                        <CartesianGrid stroke="#1a1a2e" vertical={false} />
-                        <XAxis dataKey="date" tick={{ fill: "#444", fontSize: 10 }} />
-                        <YAxis tickFormatter={fmt} tick={{ fill: "#444", fontSize: 10 }} width={30} />
-                        <Tooltip content={<CTip />} />
-                        <Line type="monotone" dataKey="dau" name="DAU" stroke="#FFD700" strokeWidth={2} dot={{ fill: "#FFD700", r: 3 }} />
-                      </LineChart>
-                    </ResponsiveContainer>
-                  )}
-                </div>
-
-                {/* Sessions (if available) */}
-                {trend.length > 0 && trend.some(t => t.sessions > 0) && (
-                  <div className="card">
-                    <p style={{ fontSize: 12, color: "#555", marginBottom: 10 }}>🎮 セッション数</p>
-                    <ResponsiveContainer width="100%" height={110}>
-                      <BarChart data={trend}>
-                        <XAxis dataKey="date" tick={{ fill: "#444", fontSize: 10 }} />
-                        <YAxis tickFormatter={fmt} tick={{ fill: "#444", fontSize: 10 }} width={30} />
-                        <Tooltip content={<CTip />} />
-                        <Bar dataKey="sessions" name="Sessions" fill="#A855F7" radius={[3, 3, 0, 0]} />
-                      </BarChart>
-                    </ResponsiveContainer>
-                  </div>
-                )}
-              </>
-            ) : (
-              <div className="card" style={{ height: 180, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8 }}>
-                <div style={{ fontSize: 40 }}>🏝️</div>
-                <div style={{ fontSize: 13, color: "#333" }}>「島を探す」で選択</div>
-              </div>
-            )}
-
-            {/* DAU mini bar */}
-            {!loading && valid.length > 0 && (
-              <div className="card">
-                <p style={{ fontSize: 12, color: "#555", marginBottom: 10 }}>🏅 DAU 上位5</p>
-                <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-                  {valid.slice(0, 5).map((d, i) => (
-                    <div key={i} style={{ display: "flex", alignItems: "center", gap: 7 }}>
-                      <div style={{ width: 12, fontSize: 10, color: "#444", flexShrink: 0, textAlign: "right" }}>{i + 1}</div>
-                      <div style={{ flex: 1, height: 7, background: "#1a1a2e", borderRadius: 4, overflow: "hidden" }}>
-                        <div style={{ height: "100%", width: `${(d.dau / (valid[0]?.dau || 1)) * 100}%`, background: COLORS[i], borderRadius: 4, transition: "width 1s ease" }} />
-                      </div>
-                      <div style={{ fontSize: 11, color: COLORS[i], width: 40, textAlign: "right", fontWeight: 700, flexShrink: 0 }}>{fmt(d.dau)}</div>
-                    </div>
+                    </defs>
+                    <CartesianGrid stroke="#12132a" vertical={false} />
+                    <XAxis dataKey="time" tick={{ fill:"#444", fontSize:10 }} interval="preserveStartEnd" />
+                    <YAxis tickFormatter={fmt} tick={{ fill:"#444", fontSize:10 }} width={32} />
+                    <Tooltip content={<CTip />} />
+                    <Legend />
+                    {MY_ISLANDS.map(isl => (
+                      <Area key={isl.code} type="monotone" dataKey={isl.short} name={meta[isl.code]?.title?.slice(0,12) || isl.short}
+                        stroke={isl.color} fill={`url(#grad_${isl.short})`} strokeWidth={2} dot={false} />
+                    ))}
+                  </AreaChart>
+                </ResponsiveContainer>
+              )}
+            </>
+          ) : tab === "daily" ? (
+            <>
+              <div style={{ fontSize:12, color:"#555", marginBottom:14 }}>日間アクティブユーザー数（過去7日間）</div>
+              {history.length === 0 ? (
+                <div style={{ textAlign:"center", color:"#333", padding:"60px 0", fontSize:14 }}>データなし</div>
+              ) : (
+                <ResponsiveContainer width="100%" height={320}>
+                  <BarChart data={history} margin={{ top:5, right:20, bottom:5, left:0 }}>
+                    <CartesianGrid stroke="#12132a" vertical={false} />
+                    <XAxis dataKey="date" tick={{ fill:"#444", fontSize:10 }} />
+                    <YAxis tickFormatter={fmt} tick={{ fill:"#444", fontSize:10 }} width={36} />
+                    <Tooltip content={<CTip />} />
+                    <Legend />
+                    {MY_ISLANDS.map(isl => (
+                      <Bar key={isl.code} dataKey={isl.short} name={meta[isl.code]?.title?.slice(0,12) || isl.short}
+                        fill={isl.color} radius={[3,3,0,0]} stackId="a" />
+                    ))}
+                  </BarChart>
+                </ResponsiveContainer>
+              )}
+            </>
+          ) : tab === "sessions" ? (
+            <>
+              <div style={{ fontSize:12, color:"#555", marginBottom:14 }}>セッション数（過去7日間）</div>
+              {history.length === 0 ? (
+                <div style={{ textAlign:"center", color:"#333", padding:"60px 0" }}>データなし</div>
+              ) : (
+                <ResponsiveContainer width="100%" height={320}>
+                  <LineChart data={history} margin={{ top:5, right:20, bottom:5, left:0 }}>
+                    <CartesianGrid stroke="#12132a" vertical={false} />
+                    <XAxis dataKey="date" tick={{ fill:"#444", fontSize:10 }} />
+                    <YAxis tickFormatter={fmt} tick={{ fill:"#444", fontSize:10 }} width={36} />
+                    <Tooltip content={<CTip />} />
+                    <Legend />
+                    {MY_ISLANDS.map(isl => (
+                      <Line key={isl.code} type="monotone" dataKey={`${isl.short}_sessions`}
+                        name={meta[isl.code]?.title?.slice(0,12) || isl.short}
+                        stroke={isl.color} strokeWidth={2} dot={{ r:3, fill:isl.color }} />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+            </>
+          ) : tab === "duration" ? (
+            <>
+              <div style={{ fontSize:12, color:"#555", marginBottom:14 }}>平均プレイ時間（分）— 過去7日間</div>
+              {history.length === 0 ? (
+                <div style={{ textAlign:"center", color:"#333", padding:"60px 0" }}>データなし</div>
+              ) : (
+                <ResponsiveContainer width="100%" height={320}>
+                  <LineChart data={history} margin={{ top:5, right:20, bottom:5, left:0 }}>
+                    <CartesianGrid stroke="#12132a" vertical={false} />
+                    <XAxis dataKey="date" tick={{ fill:"#444", fontSize:10 }} />
+                    <YAxis tick={{ fill:"#444", fontSize:10 }} width={28} unit="分" />
+                    <Tooltip content={<CTip />} />
+                    <Legend />
+                    {MY_ISLANDS.map(isl => (
+                      <Line key={isl.code} type="monotone" dataKey={`${isl.short}_dur`}
+                        name={meta[isl.code]?.title?.slice(0,12) || isl.short}
+                        stroke={isl.color} strokeWidth={2} dot={{ r:3, fill:isl.color }} />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize:12, color:"#555", marginBottom:14 }}>各メトリクスの相対比較（100 = 4島中の最大値）</div>
+              <ResponsiveContainer width="100%" height={320}>
+                <RadarChart data={radarData} margin={{ top:10, right:30, bottom:10, left:30 }}>
+                  <PolarGrid stroke="#1a1c38" />
+                  <PolarAngleAxis dataKey="metric" tick={{ fill:"#666", fontSize:12 }} />
+                  <PolarRadiusAxis angle={90} domain={[0,100]} tick={{ fill:"#333", fontSize:9 }} />
+                  {MY_ISLANDS.map(isl => (
+                    <Radar key={isl.code} name={meta[isl.code]?.title?.slice(0,12) || isl.short}
+                      dataKey={isl.short} stroke={isl.color} fill={isl.color} fillOpacity={0.15} strokeWidth={2} />
                   ))}
-                </div>
-              </div>
-            )}
+                  <Legend />
+                  <Tooltip content={<CTip />} />
+                </RadarChart>
+              </ResponsiveContainer>
+            </>
+          )}
+        </div>
+
+        {/* ── Per-island detail table ── */}
+        <div className="card">
+          <div style={{ fontSize:12, color:"#555", marginBottom:12 }}>📊 最新スナップショット（直近1時間）</div>
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+              <thead>
+                <tr style={{ borderBottom:"1px solid #1a1c38" }}>
+                  {["島名","コード","DAU","セッション数","平均プレイ時間","総プレイ時間(分)"].map(h => (
+                    <th key={h} style={{ padding:"8px 12px", textAlign:"left", color:"#555", fontWeight:600, fontSize:11, letterSpacing:.5, whiteSpace:"nowrap" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {MY_ISLANDS.map((isl, i) => {
+                  const lv = latest[isl.code] || {};
+                  const m  = meta[isl.code] || {};
+                  return (
+                    <tr key={isl.code} style={{ borderBottom:"1px solid #0e0f22" }}>
+                      <td style={{ padding:"10px 12px" }}>
+                        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                          <div style={{ width:8, height:8, borderRadius:"50%", background:isl.color, boxShadow:`0 0 5px ${isl.color}`, flexShrink:0 }} />
+                          <span style={{ fontWeight:600, color:"#ccc" }}>{loading ? "—" : (m.title || isl.short)}</span>
+                        </div>
+                      </td>
+                      <td style={{ padding:"10px 12px", fontFamily:"monospace", fontSize:11, color:"#3a3a5c" }}>{isl.code}</td>
+                      <td style={{ padding:"10px 12px", color:isl.color, fontWeight:700 }}>{loading ? "—" : fmt(lv.dau)}</td>
+                      <td style={{ padding:"10px 12px", color:"#aaa" }}>{loading ? "—" : fmt(lv.sessions)}</td>
+                      <td style={{ padding:"10px 12px", color:"#aaa" }}>{loading ? "—" : fmtMin(lv.playDuration)}</td>
+                      <td style={{ padding:"10px 12px", color:"#aaa" }}>{loading ? "—" : fmt(lv.totalMinutes)}</td>
+                    </tr>
+                  );
+                })}
+                {/* Totals row */}
+                <tr style={{ borderTop:"2px solid #FFD70033", background:"#FFD7000a" }}>
+                  <td colSpan={2} style={{ padding:"10px 12px", color:"#FFD700", fontWeight:700, fontSize:12 }}>合計 / 平均</td>
+                  <td style={{ padding:"10px 12px", color:"#FFD700", fontWeight:700 }}>{fmt(totalDAU)}</td>
+                  <td style={{ padding:"10px 12px", color:"#FFD700", fontWeight:700 }}>{fmt(totalSessions)}</td>
+                  <td style={{ padding:"10px 12px", color:"#FFD700", fontWeight:700 }}>{fmtMin(Math.round(avgDuration))}</td>
+                  <td style={{ padding:"10px 12px", color:"#555" }}>—</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </div>
+
       </main>
     </div>
   );
